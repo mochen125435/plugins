@@ -1,0 +1,31 @@
+{
+  "name": "magpie-minekuai",
+  "version": "0.1.0",
+  "description": "Magpie provider for 麦块云 (minekuai.cn): OpenAI-compatible relay keys plus account quota read from the site's own console API",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.mjs"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "provider",
+    "minekuai",
+    "麦块云",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgcm9sZT0iaW1nIiBhcmlhLWxhYmVsPSJNYWlrdWFpIj48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzE2MjEzMyIvPjxwYXRoIGQ9Ik0xNiA0MGgxMHYxMEgxNnptMTEgMGgxMHYxMEgyN3ptMTEgMGgxMHYxMEgzOHpNMTYgMjloMTB2MTBIMTZ6bTExIDBoMTB2MTBIMjd6bTExIDBoMTB2MTBIMzh6IiBmaWxsPSIjNTVkOWU2Ii8+PC9zdmc+"
+  }
+}
