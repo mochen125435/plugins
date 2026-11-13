@@ -1,0 +1,32 @@
+{
+  "name": "magpie-scnet",
+  "version": "0.1.0",
+  "description": "Magpie provider for 超算互联网 (SCNet): Token Plan and free-quota tiers, each with its own API key",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.mjs"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "provider",
+    "scnet",
+    "超算互联网",
+    "token-plan",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgcm9sZT0iaW1nIiBhcmlhLWxhYmVsPSJTQ05ldCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMwYjFmM2QiLz48cGF0aCBkPSJNMjAgMjJoMjR2NmgtMTJ2NGgxMnYxMEgyMHYtNmgxMnYtNEgyMHoiIGZpbGw9IiM0ZGEzZmYiLz48L3N2Zz4="
+  }
+}
