@@ -825,7 +825,7 @@ async function ssoLogin(phone, password) {
 
   const header = jarToHeader(jar)
   // 会话 Cookie 至少要有 Token；没有就说明登录没成功
-  if (!/[&; ]Token=/.test(header)) {
+  if (!/(^|[&; ])Token=/.test(header)) {
     throw new Error("SSO 登录未建立会话（可能密码错误、需要验证码或账号被锁定）")
   }
   return header
@@ -1117,6 +1117,7 @@ export const _internal = {
   usageFromFree,
   readUsage,
   browserCookieCandidates,
+  ssoLogin,
   saveWebCookie,
   contextLimitOf,
   checkTier,
