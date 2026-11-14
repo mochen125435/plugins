@@ -218,14 +218,15 @@ async function fetchModels(base, key) {
  * 麦块云是纯文本对话网关，不提供图片/音频，也不公开模型的推理档位，
  * 所以能力位保守设置，价格为 0（magpie 自己按 token 统计算费用）。
  *
- * 上下文上限必须声明：站点实测 DeepSeek 系列的上限是 640,000 tokens，
- * 超过后返回 400（"This model's maximum context length is 640000 tokens"）。
+ * 上下文上限必须声明：站点实测 DeepSeek 系列的硬上限是 640,000 tokens，
+ * 超过后返回 400（"This model's maximum context length is 640000 tokens"）。声明 600K，
+ * 给 magpie 的自动压缩留出余量，保证在硬上限之前触发，而不是贴着边界。
  * 如果声明为 0（未知），magpie 不知道该提前压缩会话，会把整段历史
  * 直接发过去，长会话必然 400。模型名以 deepseek 开头的按 640K 声明，
  * 其他模型没有实测数据，保持 0 让 magpie 自己兜底。
  */
 const CONTEXT_LIMITS = [
-  { match: /^deepseek/i, context: 640_000 },
+  { match: /^deepseek/i, context: 600_000 },
 ]
 
 function contextLimitOf(id) {
@@ -1211,6 +1212,7 @@ export const _internal = {
   pct,
   fetchModels,
   runtimeModel,
+  contextLimitOf,
   placeholderModel,
   usageFrom,
   webTokenOf,
