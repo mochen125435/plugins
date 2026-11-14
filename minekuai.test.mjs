@@ -26,6 +26,7 @@ const {
   GROUP_CONTEXT,
   groupNameOf,
   groupWindow,
+  narrowUsage,
   fmtK,
   runtimeModel,
 } = _internal
@@ -359,4 +360,48 @@ test("runtimeModel 把分组上下文写进 limit.context", () => {
   assert.equal(paygo.limit.context, 600_000)
   const free = runtimeModel({ id: "deepseek-v4.1-flash-1017", name: "DeepSeek" }, "https://minekuai.cn/v1", "minekuai", "default")
   assert.equal(free.limit.context, 256_000)
+})
+
+// ---- 按分组裁剪额度显示 -----------------------------------------------------
+
+const BOTH_BUCKETS = {
+  paid: { group: "paygo", groupName: "按量付费", balance: 900, totalIn: 1000, totalUsed: 100 },
+  permanent: { balance: 50, totalIn: 60, totalUsed: 10 },
+  remaining: 110,
+}
+
+test("narrowUsage 付费组只留付费桶，余额只算付费", () => {
+  const out = usageFrom(BOTH_BUCKETS, "u")
+  narrowUsage(out, BOTH_BUCKETS, "paygo")
+  assert.deepEqual(out.windows.map((w) => w.name), ["付费按量 token"])
+  assert.equal(out.plan, "按量付费")
+  assert.equal(out.balance, "900 token")
+})
+
+test("narrowUsage 免费组只留免费桶，余额用站点 remaining（今日 + 永久）", () => {
+  const out = usageFrom(BOTH_BUCKETS, "u")
+  narrowUsage(out, BOTH_BUCKETS, "default")
+  assert.deepEqual(out.windows.map((w) => w.name), ["免费按量额度"])
+  assert.equal(out.plan, "Lite 免费")
+  // remaining 是本 key 真正能用的总量，不是付费+免费相加
+  assert.equal(out.balance, "110 token")
+})
+
+test("narrowUsage 免费组去掉「付费套餐用完」这类与它无关的错误", () => {
+  const data = {
+    paid: { group: "paygo", groupName: "按量付费", balance: 0, totalIn: 1000, totalUsed: 1000 },
+    permanent: { balance: 50, totalIn: 60, totalUsed: 10 },
+    remaining: 50,
+  }
+  const out = usageFrom(data, "u")
+  assert.match(out.error, /付费/)
+  narrowUsage(out, data, "default")
+  assert.equal(out.error, undefined)
+})
+
+test("narrowUsage 分组未知时原样返回，不猜", () => {
+  const out = usageFrom(BOTH_BUCKETS, "u")
+  const before = out.windows.map((w) => w.name)
+  narrowUsage(out, BOTH_BUCKETS, undefined)
+  assert.deepEqual(out.windows.map((w) => w.name), before)
 })
