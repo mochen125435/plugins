@@ -13,6 +13,9 @@ import { createServer } from "node:http"
 import { MinekuaiPlugin, _internal } from "./minekuai.mjs"
 
 const GOOD_KEY = "sk-fake-test-0001"
+// 第二把假 key（免费分组）。前 8 位是 key 的身份（站点按前缀匹配），
+// 这里刻意改成 free- 开头，才能和 GOOD_KEY 在 /app/apikeys 里区分开。
+const FREE_KEY = `free-${GOOD_KEY.slice(5)}`
 const GOOD_TOKEN = "fake-token-0001"
 const RENEWED_TOKEN = "fake-token-0002"
 const CLIENT_ID = "428a8310cd442757ae699df5d894f051"
@@ -93,6 +96,49 @@ const DAILY_BODY = {
   },
 }
 
+// GET /app/llm/requests/summary 的真实形状（2026-11-14 抓包）
+// 与 daily 的区别：这是「区间汇总」，且认 apiKeyId，能按单把 key 分开统计。
+// 数字取自当天实测：付费 key 429 次 / 7786.17 万，免费 key 28 次 / 130.50 万。
+const SUMMARY_BY_KEY = {
+  // 付费按量那把 key（magpie）
+  "2121078704437501954": {
+    // 为了和 DAILY_BODY 的账号级数字对得上，这里仍用 17 次 / 569.97 万
+    requests: 17,
+    success: 17,
+    failed: 0,
+    pending: 0,
+    blocked: 0,
+    inputTokens: 1156619,
+    cacheReadTokens: 4533632,
+    cacheWriteTokens: 0,
+    outputTokens: 9462,
+    cacheRate: "0.7900",
+    points: "0.0000",
+    avgDurationMs: 1200,
+    avgFirstTokenMs: 300,
+    beginTime: "2026-11-13 00:00:00",
+    endTime: "2026-11-13 23:59:59",
+  },
+  // Lite 免费那把 key（1）
+  "2121581184896888833": {
+    requests: 28,
+    success: 28,
+    failed: 0,
+    pending: 0,
+    blocked: 0,
+    inputTokens: 300000,
+    cacheReadTokens: 1000000,
+    cacheWriteTokens: 0,
+    outputTokens: 5000,
+    cacheRate: "0.7700",
+    points: "0.0000",
+    avgDurationMs: 900,
+    avgFirstTokenMs: 250,
+    beginTime: "2026-11-13 00:00:00",
+    endTime: "2026-11-13 23:59:59",
+  },
+}
+
 let server
 let base
 
@@ -109,11 +155,13 @@ const state = {
   checkinReply: "already", // "ok" | "already" | "fail"
   loginFails: false,
   keyGroup: "paygo", // 密钥分组：paygo（付费按量）/ default（Lite 免费）
+  summaryFails: false, // true = /app/llm/requests/summary 故意失败，用来测退回账号级汇总
   reset() {
     this.validTokens = null
     this.checkinReply = "already"
     this.loginFails = false
     this.keyGroup = "paygo"
+    this.summaryFails = false
     // 分组信息有 10 分钟缓存，切换假分组后要清掉，否则读到上一个用例的值
     _internal.keyInfoCache.clear()
   },
@@ -186,8 +234,37 @@ before(async () => {
             quotaPoints: null,
             usedPoints: "0.0000",
           },
+          {
+            // 同一个账号下的另一把 key：groupCode 为 null = 跟随会员挡位（Lite 免费）
+            id: "2121581184896888833",
+            name: "1",
+            keyPrefix: FREE_KEY.slice(0, 8),
+            status: "0",
+            groupCode: null,
+            modelAllow: "deepseek-v4.1-flash-1017",
+            quotaPoints: null,
+            usedPoints: "0.0000",
+          },
         ],
       })
+    }
+
+    // 单把 key 的区间汇总：认 beginTime / endTime / apiKeyId
+    // 真实站点 2026-11-14 实测：不带 apiKeyId = 整个账号的量
+    // （付费 key 429 次 + 免费 key 28 次 = 账号级 457 次）
+    if (req.url.startsWith("/app/llm/requests/summary")) {
+      if (!tokenOk(auth) || clientid !== CLIENT_ID) {
+        return send(200, { code: 401, data: null, msg: "认证失败，无法访问系统资源" })
+      }
+      if (state.summaryFails) {
+        return send(200, { code: 500, data: null, msg: "统计服务暂时不可用" })
+      }
+      const keyId = new URL(req.url, "http://x").searchParams.get("apiKeyId")
+      const row = SUMMARY_BY_KEY[keyId]
+      if (!row) {
+        return send(200, { code: 400, data: null, msg: "缺少 apiKeyId" })
+      }
+      return send(200, { code: 200, msg: "操作成功", data: row })
     }
 
     // 每日用量
@@ -388,7 +465,10 @@ test("provider.models 在 Lite 免费分组按 256K 声明上下文", async () =
   const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
 
   const models = await p.provider.models({ models: {} }, { auth })
-  assert.equal(models["deepseek-v4.1-flash-1017"].limit.context, 256_000)
+  // Lite 组的模型名带 -lite 后缀：两组的 id 不同，才能各自记各自的上下文
+  assert.equal(models["deepseek-v4.1-flash-1017-lite"].limit.context, 256_000)
+  // 原 id 不再出现，避免同一 provider 下同一模型有两个上下文声明
+  assert.equal(models["deepseek-v4.1-flash-1017"], undefined)
 })
 
 test("没有网页令牌、读不到分组时按 256K 保守声明", async () => {
@@ -428,7 +508,7 @@ test("usage 用网页令牌 + clientid 只读出这把 key 对应的额度窗口
   assert.match(u.windows[1].display, /600K/)
   assert.equal(u.windows[2].name, "鱼币余额")
   assert.equal(u.windows[2].display, "40 鱼币")
-  assert.equal(u.windows[3].name, "今日用量")
+  assert.equal(u.windows[3].name, "今日用量（本 key）")
   // 1156619 + 4533632 + 9462 = 5,699,713 → 569.97 万
   assert.equal(u.windows[3].display, "569.97 万 token · 17 次调用")
   assert.equal(u.windows[4].name, "每日签到")
@@ -454,12 +534,67 @@ test("usage 在 Lite 免费分组只显示免费额度与免费余额", async ()
   // 免费 key 不该看到付费桶，也不该把付费余额算进余额
   assert.deepEqual(
     u.windows.map((w) => w.name),
-    ["免费按量额度", "额度分组", "鱼币余额", "今日用量", "每日签到"]
+    ["免费按量额度", "额度分组", "鱼币余额", "今日用量（本 key）", "每日签到"]
   )
   assert.match(u.windows[1].display, /Lite 免费/)
   assert.match(u.windows[1].display, /256K/)
   assert.equal(u.plan, "Lite 免费")
   assert.equal(u.balance, "1,000 万 token")
+})
+
+// ---- 今日用量按 key 分开统计 -------------------------------------------------
+
+test("今日用量按「本 key」统计：同一账号下付费 key 与免费 key 数字不同", async () => {
+  state.reset()
+  const p = await plugin()
+  const paidAuth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+  const freeAuth = { type: "api", key: FREE_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  const paid = await p.auth.usage(async () => paidAuth)
+  const free = await p.auth.usage(async () => freeAuth)
+
+  const paidRow = paid.windows.find((w) => w.name === "今日用量（本 key）")
+  const freeRow = free.windows.find((w) => w.name === "今日用量（本 key）")
+  assert.ok(paidRow && freeRow, "两张卡片都应当有按 key 的今日用量行")
+
+  // 付费 key：1156619 + 4533632 + 9462 = 5,699,713 → 569.97 万
+  assert.equal(paidRow.display, "569.97 万 token · 17 次调用")
+  // 免费 key：300000 + 1000000 + 5000 = 1,305,000 → 130.5 万
+  assert.equal(freeRow.display, "130.5 万 token · 28 次调用")
+  // 关键：两把 key 不再共用同一个账号级数字
+  assert.notEqual(paidRow.display, freeRow.display)
+})
+
+test("今日用量的请求带本 key 的 apiKeyId 与当天时间范围", async () => {
+  state.reset()
+  seen.length = 0
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  await p.auth.usage(async () => auth)
+
+  const q = seen.find((s) => s.path.startsWith("/app/llm/requests/summary"))
+  assert.ok(q, "应当请求 /app/llm/requests/summary")
+  assert.match(q.path, /apiKeyId=2121078704437501954/)
+  const today = _internal.localDate()
+  assert.match(q.path, new RegExp(`beginTime=${encodeURIComponent(`${today} 00:00:00`)}`))
+  assert.match(q.path, new RegExp(`endTime=${encodeURIComponent(`${today} 23:59:59`)}`))
+  assert.equal(q.clientid, CLIENT_ID)
+  assert.equal(q.auth, `Bearer ${GOOD_TOKEN}`)
+})
+
+test("summary 不可用时退回账号级今日用量，并标明是账号口径", async () => {
+  state.reset()
+  state.summaryFails = true
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  const u = await p.auth.usage(async () => auth)
+
+  // 退回账号级：行名不带「本 key」，数字来自 /app/llm/requests/daily
+  const row = u.windows.find((w) => w.name === "今日用量")
+  assert.ok(row, "应当退回账号级的今日用量行")
+  assert.equal(row.display, "569.97 万 token · 17 次调用")
 })
 
 test("usage 在没填网页令牌时给出可操作的提示", async () => {

@@ -301,6 +301,40 @@ test("dailyWindow 没有数据时返回 null，不编造 0", () => {
   assert.equal(dailyWindow(undefined), null)
 })
 
+test("dailyWindow 能吃 /app/llm/requests/summary 的单 key 汇总，并标明范围", () => {
+  // summary 的 data：已经按 apiKeyId 过滤过，本身就是一行，没有 daily 数组
+  const w = dailyWindow(
+    {
+      requests: 28,
+      success: 28,
+      inputTokens: 300000,
+      cacheReadTokens: 1000000,
+      cacheWriteTokens: 0,
+      outputTokens: 5000,
+      points: "0.0000",
+      beginTime: "2026-11-14 00:00:00",
+      endTime: "2026-11-14 23:59:59",
+    },
+    localDate(),
+    "key"
+  )
+  assert.equal(w.name, "今日用量（本 key）")
+  // 30 万 + 100 万 + 0.5 万 = 130.5 万
+  assert.equal(w.display, "130.5 万 token · 28 次调用")
+})
+
+test("dailyWindow 的 key 口径在没有调用时说暂无调用", () => {
+  const w = dailyWindow({ requests: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 }, localDate(), "key")
+  assert.equal(w.display, "今日暂无调用")
+})
+
+test("dailyWindow 账号口径的行名不带「本 key」", () => {
+  const w = dailyWindow({
+    daily: [{ date: localDate(), inputTokens: 10, cacheReadTokens: 0, outputTokens: 0, requests: 1 }],
+  })
+  assert.equal(w.name, "今日用量")
+})
+
 // ---- 密钥分组与上下文 -------------------------------------------------------
 
 test("contextLimitOf 按分组给出不同上下文：paygo 600K / Lite 256K", () => {

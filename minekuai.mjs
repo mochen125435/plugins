@@ -597,20 +597,36 @@ function pointsWindow(wallet) {
 /**
  * dailyWindow 做「今日用量」行。
  *
- * 数据来自 GET /app/llm/requests/daily 的某一日：
- *   { date, inputTokens, cacheReadTokens, outputTokens, requests, success, failed, points }
+ * 支持两种数据形状，取决于调用方拿到了哪一种：
+ *
+ *   1. 账号级日汇总（GET /app/llm/requests/daily 的 data）：
+ *      { daily: [{ date, inputTokens, cacheReadTokens, outputTokens, requests, … }] }
+ *      这份数据是**整个账号**的，同一个账号下的两把 key 会显示成一模一样的数字。
+ *
+ *   2. 单把 key 的区间汇总（GET /app/llm/requests/summary 的 data）：
+ *      { requests, inputTokens, cacheReadTokens, outputTokens, points, … }
+ *      已经按 apiKeyId 过滤过，直接就是这把 key 的量，不再按日期切分。
  *
  * 口径必须和站点一致：站点的「Token」= 未命中输入 + 缓存读 + 输出
  * （前端 AdminLlmStats 的说明就是这三项），不能只算 input+output，
  * 否则缓存命中的大额部分会凭空消失。
  *
  * 用 aside 行：只展示，不参与路由。
+ *
+ * @param {object} data 上述两种形状之一
+ * @param {string} today 今天（YYYY-MM-DD），只在形状 1 里用来挑行
+ * @param {"account"|"key"} scope 数据范围，决定行名叫「今日用量」还是「今日用量（本 key）」
  */
-function dailyWindow(data, today = localDate()) {
-  const rows = Array.isArray(data?.daily) ? data.daily : []
-  if (!rows.length) return null
-  // 站点按自然日给行；优先取今天，跨时区/请求跨天时退回最后一行
-  const row = rows.find((r) => r?.date === today) ?? rows[rows.length - 1]
+function dailyWindow(data, today = localDate(), scope = "account") {
+  let row = null
+
+  if (Array.isArray(data?.daily) && data.daily.length) {
+    // 形状 1：站点按自然日给行；优先取今天，跨时区/请求跨天时退回最后一行
+    row = data.daily.find((r) => r?.date === today) ?? data.daily[data.daily.length - 1]
+  } else if (data && data.requests !== undefined && data.daily === undefined) {
+    // 形状 2：区间汇总，本身就是一行
+    row = data
+  }
   if (!row) return null
 
   const input = num(Number(row.inputTokens)) ?? 0
@@ -620,7 +636,7 @@ function dailyWindow(data, today = localDate()) {
   const total = input + cache + output
 
   return {
-    name: "今日用量",
+    name: scope === "key" ? "今日用量（本 key）" : "今日用量",
     used: 0,
     remaining: 100,
     aside: true,
@@ -756,11 +772,13 @@ async function readUsage(client, id, auth, base) {
   // 分组行：让「这把 key 扣哪种额度、按多少上下文跑」直接可见。
   // 付费按量与 Lite 免费两组的模型上下文不同（640K / 256K），混用了不会报错，
   // 只会悄悄按低的那组跑，所以必须显式展示出来。
+  // keyInfo 后面「今日用量」还要用它的 id 做按 key 汇总，所以提到外面
+  let keyInfo = null
   try {
-    const info = await fetchKeyInfo(base, r.token, auth.key)
+    keyInfo = await fetchKeyInfo(base, r.token, auth.key)
     // 先按分组裁掉用不上的额度桶，再挂分组说明行
-    narrowUsage(out, r.data, info?.group)
-    const win = groupWindow(info, r.data)
+    narrowUsage(out, r.data, keyInfo?.group)
+    const win = groupWindow(keyInfo, r.data)
     if (win) out.windows.push(win)
   } catch {
     // 分组读不到不影响额度显示
@@ -775,13 +793,25 @@ async function readUsage(client, id, auth, base) {
     // 钱包读不到时不显示这一行，额度照常
   }
 
-  // 今日用量行：读不到只省略这一行，不影响额度
+  // 今日用量行：优先按「本 key」统计，读不到才退回账号级汇总。
+  //
+  // 为什么按 key：麦块云一个账号下可以有多把 key，分属付费按量与 Lite 免费两套额度。
+  // 账号级汇总会把两把 key 的用量加在一起，两张卡片显示同一个数字，
+  // 既分不清免费额度烧了多少、也分不清付费余额烧了多少。
   try {
-    const d = await dailyUsage(base, r.token)
-    const win = dailyWindow(d)
+    const scoped = await keyDailyUsage(base, r.token, keyInfo?.id)
+    const win = scoped
+      ? dailyWindow(scoped, localDate(), "key")
+      : dailyWindow(await dailyUsage(base, r.token))
     if (win) out.windows.push(win)
   } catch {
-    // 每日用量读不到时不显示这一行，额度照常
+    // summary 读不到时再试一次账号级；都失败就省略这一行，额度照常
+    try {
+      const win = dailyWindow(await dailyUsage(base, r.token))
+      if (win) out.windows.push(win)
+    } catch {
+      // 每日用量读不到时不显示这一行，额度照常
+    }
   }
 
   // 签到状态行：读失败只省略这一行，绝不影响额度
@@ -1010,6 +1040,50 @@ async function dailyUsage(base, token) {
   const hasToday = Array.isArray(data?.daily) && data.daily.some((r) => r?.date === today)
   if (!hasToday) data = await read(2)
   return data
+}
+
+/**
+ * keyDailyUsage 读「这一把 key 今天用了多少」。
+ *
+ * 为什么不能直接用 dailyUsage：
+ *   /app/llm/requests/daily 只做账号级汇总，**没有任何可用的过滤参数**。
+ *   2026-11-14 实测：带 apiKeyId=、groupCode=paygo、groupCode=lite_token
+ *   请求时返回的数字与不带参数完全一样，都是整个账号的量。
+ *   结果就是同一账号下的付费 key 与免费 key 两张卡片上，
+ *   「今日用量」显示成同一个数字（7753.32 万 · 428 次），
+ *   既看不出免费额度烧了多少，也看不出付费余额烧了多少。
+ *
+ * 可用的接口是 GET /app/llm/requests/summary，它认三个参数：
+ *   beginTime / endTime（"YYYY-MM-DD HH:mm:ss"，闭区间）
+ *   apiKeyId（/app/apikeys 里那把 key 的 id）
+ * 返回 { requests, success, failed, pending, blocked,
+ *        inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens,
+ *        cacheRate, points, avgDurationMs, avgFirstTokenMs, beginTime, endTime }
+ *
+ * 实测（2026-11-14 当天）：
+ *   不带 key → 457 次 / 7916.67 万 token
+ *   付费 key → 429 次 / 7786.17 万 token
+ *   免费 key →  28 次 /  130.50 万 token
+ *   429 + 28 = 457，与账号级一致，说明按 key 过滤口径正确、无遗漏。
+ *
+ * 另注：细节日志 GET /app/llm/requests 也支持 apiKeyId 过滤，但它是按行分页返回
+ * （pageNum 才是页码，page= 无效；pageSize 上限 100），要自己累加几百行才好得到
+ * 总量。summary 一次请求就给出汇总，故采用 summary。
+ *
+ * @returns {Promise<object|null>} summary 的 data；读不到返回 null
+ */
+async function keyDailyUsage(base, token, keyId) {
+  if (!keyId) return null
+  const day = localDate()
+  const q = encodeURIComponent
+  const body = await httpJson(
+    base,
+    `/app/llm/requests/summary?beginTime=${q(`${day} 00:00:00`)}` +
+      `&endTime=${q(`${day} 23:59:59`)}` +
+      `&apiKeyId=${q(String(keyId))}`,
+    { token, headers: { clientid: CLIENT_ID } }
+  )
+  return body?.data ?? null
 }
 
 /**
@@ -1461,6 +1535,7 @@ export const _internal = {
   checkinStatus,
   walletStatus,
   dailyUsage,
+  keyDailyUsage,
   dailyWindow,
   checkin,
   checkinOutcome,
