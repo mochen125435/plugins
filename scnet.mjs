@@ -40,7 +40,7 @@ import { homedir } from "node:os"
 import { join, sep } from "node:path"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
-import { createDecipheriv, createHash, pbkdf2Sync, timingSafeEqual } from "node:crypto"
+import { createDecipheriv, createHash, pbkdf2Sync, timingSafeEqual, publicEncrypt } from "node:crypto"
 
 const run = promisify(execFile)
 
@@ -417,11 +417,38 @@ async function readUsage(client, id, auth, tier) {
     }
   }
 
-  // 只有「会话失效」才值得去浏览器续期；其他错误（网络等）重试也没用
+  // 只有「会话失效」才值得续期；其他错误（网络等）重试也没用
   if (r.signIn !== "expired") return r
 
-  // 从默认浏览器的每个资料里读 Cookie 候选，逐个拿去请求额度接口验证，
-  // 哪个资料里的会话有效就用哪个——登录的窗口不一定是「最近使用」的资料
+  // 首选：账号密码走 SSO 登录换全新会话（凭据存于账号 metadata）
+  const phone = auth?.metadata?.phone
+  const ssoPassword = auth?.metadata?.password
+  if (phone && ssoPassword) {
+    try {
+      const fresh = await ssoLogin(phone, ssoPassword)
+      const saved = await saveWebCookie(client, id, auth, fresh)
+      let r2
+      try {
+        if (tier === "tokenplan") {
+          r2 = usageFromTokenPlan(await tokenPlanPlans(fresh), user)
+        } else {
+          r2 = usageFromFree(await freeQuotaResources(fresh), user)
+        }
+      } catch (e) {
+        return {
+          user,
+          windows: [],
+          error: `SSO 登录成功但额度查询失败：${String(e?.message ?? e)}`,
+          ...(e?.signIn ? { signIn: e.signIn } : {}),
+        }
+      }
+      return { ...r2, cookieRenewed: "sso" }
+    } catch (e) {
+      // 密码登录失败（密码改动/需要验证码等）才走浏览器候选
+    }
+  }
+
+  // 其次：从默认浏览器的每个资料里读 Cookie 候选，逐个验证
   let candidates
   try {
     candidates = await browserCookieCandidates()
@@ -675,6 +702,144 @@ async function browserCookieCandidates({ signal } = {}) {
 }
 
 // =============================================================================
+// SSO 密码自动登录（Cookie 自动续期）
+// =============================================================================
+
+// SCNet 的额度接口认网页 Cookie，而登录 Cookie 是会话级的，浏览器运行期间
+// 不写盘——所以「读浏览器 Cookie 库」的续期方式对它不可靠。
+// 唯一确定可靠的续期方式：用账号密码走一遍 SSO 登录，换取全新会话 Cookie。
+// 登录流程（2026-11-14 抓包分析）：
+//   1. GET /sso/login?service=...        → 页面里有 CAS 的 execution 令牌
+//      和登录 JS 文件名（RSA 公钥硬编码在 JS 里）；
+//   2. 密码用该公钥做 RSA PKCS#1 加密（表单字段 encrypted=true）；
+//   3. POST /sso/login（mode=0 表示账号密码登录）→ 302 重定向链建立会话；
+//   4. 沿重定向收集 Set-Cookie，拼成 Cookie 请求头。
+// 注意：登录 JS 要求附一个 name="submit" 的隐藏域（值=按钮文字），CAS 兼容。
+
+const SSO_LOGIN_URL =
+  "https://www.scnet.cn/sso/login?service=" +
+  encodeURIComponent(
+    "https://www.scnet.cn/ac/api/auth/loginSsoRedirect.action?originalUrl=https://www.scnet.cn/ui/console/index.html#/llm/token-plan"
+  )
+
+/** collectSetCookie 把一次响应的 Set-Cookie 收进 jar（Map：name → value）。 */
+function collectSetCookie(res, jar) {
+  const list =
+    typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : []
+  for (const line of list) {
+    const pair = line.split(";")[0]
+    const eq = pair.indexOf("=")
+    if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim())
+  }
+  return jar
+}
+
+/** jarToHeader 把 jar 转成 Cookie 请求头的值。 */
+function jarToHeader(jar) {
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ")
+}
+
+/** cookieHeaders 把 Cookie 字符串包成请求头对象；空串时不加该头。 */
+function cookieHeaders(cookie) {
+  return cookie ? { Cookie: cookie } : {}
+}
+/**
+ * ssoLogin 用手机号 + 密码走 SSO 登录，返回可用的 Cookie 请求头。
+ * 失败抛 Error，文案直接可读（密码错误 / 需要验证码 等）。
+ */
+async function ssoLogin(phone, password) {
+  const jar = new Map()
+
+  // 1) 登录页：execution 令牌 + 登录 JS 地址
+  const r1 = await fetch(SSO_LOGIN_URL, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(TIMEOUT),
+  })
+  const html = await r1.text()
+  collectSetCookie(r1, jar)
+  const execution = /name="execution" value="([^"]+)"/.exec(html)?.[1]
+  if (!execution) throw new Error("SSO 登录页没有返回 execution 令牌")
+  const jsUrl = /src="([^"]*login-[a-f0-9]+\.js)"/.exec(html)?.[1]
+
+  // 2) 从登录 JS 里挖 RSA 公钥（站点把它硬编码在 JS 里，密文用 base64）
+  let keyB64
+  if (jsUrl) {
+    try {
+      const js = await (
+        await fetch(new URL(jsUrl, CONSOLE_BASE).href, {
+          signal: AbortSignal.timeout(TIMEOUT),
+        })
+      ).text()
+      keyB64 = /var key = '([^']+)'/.exec(js)?.[1]
+    } catch {
+      // 拿不到 JS 就用不了密码登录
+    }
+  }
+  if (!keyB64) throw new Error("SSO 登录页没有返回 RSA 公钥，无法用密码登录")
+
+  // 3) RSA PKCS#1 加密密码（站点用 JSEncrypt，同样是 PKCS#1 v1.5）
+  const pem =
+    "-----BEGIN PUBLIC KEY-----\n" + keyB64 + "\n-----END PUBLIC KEY-----"
+  const encPassword = cryptoPublicEncrypt(pem, password)
+
+  // 4) 提交登录表单，沿 302 重定向收集会话 Cookie
+  const form = new URLSearchParams({
+    username: phone,
+    password: encPassword,
+    encrypted: "true",
+    mode: "0",
+    execution,
+    _eventId: "submit",
+    geolocation: "",
+    sensorsAnonId: "",
+    submit: "登录",
+  })
+  let res = await fetch(SSO_LOGIN_URL, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...cookieHeaders(jarToHeader(jar)),
+      "User-Agent": "magpie-scnet",
+    },
+    body: form.toString(),
+    signal: AbortSignal.timeout(TIMEOUT),
+  })
+  collectSetCookie(res, jar)
+
+  // 5) 跟随重定向链（最多 6 跳），把会话 Cookie 收齐
+  for (let hop = 0; hop < 6 && res.status >= 300 && res.status < 400; hop++) {
+    const loc = res.headers.get("location")
+    if (!loc) break
+    const hopHeaders = { "User-Agent": "magpie-scnet" }
+    if (jar.size) hopHeaders.Cookie = jarToHeader(jar)
+    res = await fetch(loc.startsWith("/") ? new URL(loc, CONSOLE_BASE).href : loc, {
+      redirect: "manual",
+      headers: hopHeaders,
+      signal: AbortSignal.timeout(TIMEOUT),
+    })
+    collectSetCookie(res, jar)
+  }
+
+  const header = jarToHeader(jar)
+  // 会话 Cookie 至少要有 Token；没有就说明登录没成功
+  if (!/[&; ]Token=/.test(header)) {
+    throw new Error("SSO 登录未建立会话（可能密码错误、需要验证码或账号被锁定）")
+  }
+  return header
+}
+
+/** cryptoPublicEncrypt 用站点公钥加密密码（PKCS#1 v1.5，与 JSEncrypt 一致）。 */
+function cryptoPublicEncrypt(pem, plain) {
+  return publicEncrypt(
+    { key: pem, padding: 1 /* RSA_PKCS1_PADDING */ },
+    Buffer.from(plain, "utf8")
+  ).toString("base64")
+}
+
+// =============================================================================
 // 账号
 // =============================================================================
 // =============================================================================
@@ -797,6 +962,19 @@ function hooks(client) {
               message: "控制台 Cookie（可选；留空则自动从默认浏览器读取）",
               placeholder: "整段 Cookie 值；留空则只做模型调用",
             },
+            {
+              type: "text",
+              key: "phone",
+              message: "手机号（可选，用于 Cookie 过期后自动续期）",
+              placeholder: "11 位手机号；不填则 Cookie 过期后需手动重登",
+            },
+            {
+              type: "password",
+              key: "ssoPassword",
+              message: "登录密码（用于 Cookie 过期后自动续期）",
+              placeholder: "与超算官网登录密码一致",
+              condition: (i) => !!String(i?.phone ?? "").trim(),
+            },
           ],
 
           async authorize(inputs) {
@@ -808,6 +986,8 @@ function hooks(client) {
                 const tier = inputs?.tier === "free" ? "free" : "tokenplan"
                 const key = String(inputs?.apiKey ?? "").trim()
                 let cookie = String(inputs?.consoleCookie ?? "").trim()
+                const phone = String(inputs?.phone ?? "").trim()
+                const ssoPassword = String(inputs?.ssoPassword ?? "")
                 if (!key) return { type: "failed", error: "没有填写 API Key" }
 
                 // 1) 拉模型列表，既是校验也是档位能力判断
@@ -856,6 +1036,16 @@ function hooks(client) {
                   }
                 }
 
+                // 手机号密码已填时先验证 SSO 登录可用，失败不阻断登录
+                let ssoNote
+                if (phone && ssoPassword) {
+                  try {
+                    await ssoLogin(phone, ssoPassword)
+                  } catch (e) {
+                    ssoNote = `SSO 自动续期暂不可用：${String(e?.message ?? e).slice(0, 200)}`
+                  }
+                }
+
                 return {
                   type: "success",
                   key,
@@ -863,6 +1053,9 @@ function hooks(client) {
                     tier,
                     baseURL: API_BASE,
                     consoleCookie: cookie || undefined,
+                    phone: phone || undefined,
+                    password: ssoPassword || undefined,
+                    ...(ssoNote ? { renewNote: ssoNote } : {}),
                   },
                   accountId: label({ key, metadata: { tier } }),
                 }
