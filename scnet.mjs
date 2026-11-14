@@ -229,7 +229,17 @@ async function consoleJson(path, { cookie, method = "GET", body } = {}) {
   }
 
   if (!res.ok) {
-    throw new Error(`${path}: HTTP ${res.status} ${text.slice(0, 160)}`)
+    const err = new Error(`${path}: HTTP ${res.status} ${text.slice(0, 160)}`)
+    // 网站会话失效时 HTTP 状态就是 401/403，必须标记 signIn，
+    // 否则额度层不会触发「从浏览器续期 Cookie」的流程
+    if (res.status === 401 || res.status === 403) err.signIn = "expired"
+    try {
+      const j = JSON.parse(text)
+      if (String(j?.code) === "401" || /未登录/.test(String(j?.msg ?? ""))) err.signIn = "expired"
+    } catch {
+      // 响应体不是 JSON 就按状态码判断
+    }
+    throw err
   }
   // 成功码是字符串 "0"；其余都按错误处理
   if (String(data?.code) !== "0") {
