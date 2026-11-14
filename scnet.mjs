@@ -35,7 +35,7 @@ const CHAT = "@ai-sdk/openai-compatible"
 // 登录态（只读、按域名过滤），从而实现「浏览器里登录一次，插件自动续期」。
 // 读取需要 magpie 拥有「完全磁盘访问」权限，解密需要用户在钥匙串弹窗里允许。
 
-import { readFile, realpath, access } from "node:fs/promises"
+import { readFile, realpath, access, readdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, sep } from "node:path"
 import { execFile } from "node:child_process"
@@ -417,36 +417,47 @@ async function readUsage(client, id, auth, tier) {
     }
   }
 
-  // 只有「会话失效 / 没有会话」才值得去浏览器续期；其他错误（网络等）重试也没用
+  // 只有「会话失效」才值得去浏览器续期；其他错误（网络等）重试也没用
   if (r.signIn !== "expired") return r
 
+  // 从默认浏览器的每个资料里读 Cookie 候选，逐个拿去请求额度接口验证，
+  // 哪个资料里的会话有效就用哪个——登录的窗口不一定是「最近使用」的资料
+  let candidates
   try {
-    const fresh = await readBrowserSession()
-    if (!fresh) throw new BrowserCookieError("默认浏览器里没有读到超算的登录会话")
-    const saved = await saveWebCookie(client, id, auth, fresh)
-    let r2
-    try {
-      if (tier === "tokenplan") {
-        r2 = usageFromTokenPlan(await tokenPlanPlans(fresh), user)
-      } else {
-        r2 = usageFromFree(await freeQuotaResources(fresh), user)
-      }
-    } catch (e) {
-      // 浏览器里的会话也失效了：明确告诉用户去官网重新登录
-      return {
-        user,
-        windows: [],
-        error: `已从默认浏览器续期 Cookie，但网站会话同样未登录：${String(e?.message ?? e)}；请先在浏览器里登录 scnet.cn`,
-        ...(e?.signIn ? { signIn: e.signIn } : {}),
-      }
-    }
-    return { ...r2, cookieRefreshed: true }
+    candidates = await browserCookieCandidates()
   } catch (e) {
     // 浏览器续期失败：保留原错误，再附上原因和下一步指引
     return {
       ...r,
       error: `${r.error}；自动续期失败：${String(e?.message ?? e)}`,
     }
+  }
+
+  let lastErr = ""
+  for (const cand of candidates) {
+    const saved = await saveWebCookie(client, id, auth, cand.cookie)
+    try {
+      let r2
+      if (tier === "tokenplan") {
+        r2 = usageFromTokenPlan(await tokenPlanPlans(cand.cookie), user)
+      } else {
+        r2 = usageFromFree(await freeQuotaResources(cand.cookie), user)
+      }
+      return { ...r2, cookieRefreshed: true, profile: cand.profile }
+    } catch (e) {
+      lastErr = String(e?.message ?? e)
+      continue // 这份资料的会话无效，换下一份
+    }
+  }
+  // 所有候选都无效：浏览器里的会话也是过期的，明确告诉用户去官网重新登录
+  const hint = candidates.length
+    ? `已尝试默认浏览器的 ${candidates.length} 份资料，会话均未登录`
+    : lastErr
+  return {
+    user,
+    windows: [],
+    error: `${hint}；请先在默认浏览器的普通窗口里登录 scnet.cn 并打开任意页面，然后点刷新重试`,
+    signIn: "expired",
   }
 }
 
@@ -544,15 +555,36 @@ function decodeCookie(row, version, key) {
 }
 
 /**
- * readBrowserSession 从默认浏览器里读出 scnet.cn 的完整 Cookie 请求头。
- *
- * 步骤：识别默认浏览器 → 定位其「最近使用的资料」→ 只读打开 Cookies 库 →
- * 过滤 scnet.cn 的行 → 从钥匙串取解密密钥（macOS 弹窗）→ 解密 → 拼成 Cookie 头。
- *
- * 任何一步失败都抛 BrowserCookieError，文案告诉用户怎么处理；
- * 绝不读取其他网站、密码或浏览记录，不写任何文件。
+ * profileDirs 枚举默认浏览器下的所有资料目录：
+ * Local State 里记录的「最近使用」排最前，其余 Default/Profile N 跟在后面。
+ * 枚举全部资料是为了解决「登录的窗口不是最近使用资料」的情况。
  */
-async function readBrowserSession({ signal } = {}) {
+async function profileDirs(base) {
+  const dirs = []
+  try {
+    const state = JSON.parse(await readFile(join(base, "Local State"), "utf8"))
+    const last = state.profile?.last_used
+    if (last && /^(Default|Profile [0-9]+)$/.test(last)) dirs.push(last)
+  } catch {
+    // Local State 读不到就只靠目录枚举
+  }
+  try {
+    for (const entry of await readdir(base)) {
+      if (/^(Default|Profile [0-9]+)$/.test(entry) && !dirs.includes(entry)) dirs.push(entry)
+    }
+  } catch {
+    // 目录读不到就只有上面那一个候选
+  }
+  return dirs
+}
+
+/**
+ * browserCookieCandidates 从默认浏览器的每个资料里读出 scnet.cn 的 Cookie。
+ *
+ * 返回 [{ profile, cookie }]，按「最近使用优先」排序；解密密钥只取一次。
+ * 这里不做有效性判断——是否有效由调用方拿去请求额度接口验证。
+ */
+async function browserCookieCandidates({ signal } = {}) {
   if (process.platform !== "darwin") {
     throw new BrowserCookieError("自动读取浏览器会话目前仅支持 macOS 的 Chrome、Edge 和 Brave")
   }
@@ -562,44 +594,17 @@ async function readBrowserSession({ signal } = {}) {
     throw new BrowserCookieError("当前默认浏览器暂不支持自动读取会话；目前支持 Chrome、Edge 和 Brave，可手动粘贴控制台 Cookie")
   }
   const [, relative, keyring] = browser
-  let profile, base
+  let base
   try {
     base = await realpath(join(homedir(), "Library", "Application Support", relative))
-    const state = JSON.parse(await readFile(join(base, "Local State"), "utf8"))
-    profile = state.profile?.last_used || "Default"
-    if (!/^(Default|Profile [0-9]+)$/.test(profile)) throw new Error("Unsupported profile")
-    const resolved = await realpath(join(base, profile))
-    if (!resolved.startsWith(base + sep)) throw new Error("Profile outside browser root")
-    base = resolved
   } catch {
-    throw new BrowserCookieError("无法读取默认浏览器的当前资料；请先在默认浏览器里登录超算官网，并确认 magpie 拥有「完全磁盘访问」权限")
-  }
-  let path
-  for (const rel of ["Network/Cookies", "Cookies"]) {
-    const candidate = join(base, rel)
-    try {
-      await access(candidate)
-    } catch {
-      continue
-    }
-    path = await realpath(candidate)
-    if (!path.startsWith(base + sep)) throw new BrowserCookieError("浏览器会话文件不在当前资料内，已停止读取")
-    break
-  }
-  if (!path) return ""
-
-  let snapshot
-  try {
-    snapshot = await readSCNetRows(path)
-  } catch {
-    throw new BrowserCookieError("暂时无法只读访问浏览器的会话数据，请稍后重试或手动粘贴控制台 Cookie")
+    throw new BrowserCookieError(`本机没有安装或未运行过 ${browser[0]}，无法读取它的会话`)
   }
 
+  // 解密密钥：从钥匙串取一次，所有资料共用；用户在 macOS 弹窗里点「允许」即可
   let key
-  const rows = snapshot.rows.filter((row) =>
-    COOKIE_HOSTS.includes(row.host_key) &&
-    (!row.has_expires || Number(row.expires_utc) / 1000 - 11644473600000 > Date.now()))
-  if (rows.some((row) => row.encrypted_value?.length)) {
+  const keyOf = async () => {
+    if (key) return key
     let password
     try {
       const { stdout } = await run("/usr/bin/security",
@@ -611,22 +616,67 @@ async function readBrowserSession({ signal } = {}) {
       if (!end) throw new Error("No key")
       key = pbkdf2Sync(password.subarray(0, end), "saltysalt", 1003, 16, "sha1")
       if (Buffer.isBuffer(stdout)) stdout.fill(0)
+      return key
     } catch {
       throw new BrowserCookieError("未获准读取浏览器钥匙串；重新触发时在 macOS 弹窗里点「允许」，或手动粘贴控制台 Cookie")
     } finally {
       password?.fill(0)
     }
   }
-  return rows
-    .map((row) => {
-      const value = decodeCookie(row, snapshot.version, key)
-      if (!/^[!#$%&'*+.^_`|~\w-]+$/.test(row.name) || /[\x00-\x20\x7f;,]/.test(value)) return ""
-      return value ? `${row.name}=${value}` : ""
-    })
-    .filter(Boolean)
-    .join("; ")
+
+  const out = []
+  for (const profile of await profileDirs(base)) {
+    let dir
+    try {
+      dir = await realpath(join(base, profile))
+      if (!dir.startsWith(base + sep)) continue
+    } catch {
+      continue // 该资料目录不存在（Local State 里残留的旧记录）
+    }
+    let path
+    for (const rel of ["Network/Cookies", "Cookies"]) {
+      const candidate = join(dir, rel)
+      try {
+        await access(candidate)
+        path = await realpath(candidate)
+        if (!path.startsWith(dir + sep)) continue
+        break
+      } catch {
+        continue
+      }
+    }
+    if (!path) continue
+    let snapshot
+    try {
+      snapshot = await readSCNetRows(path)
+    } catch {
+      continue // 这个资料的会话库读不了就跳过，不中断其他资料
+    }
+    try {
+      const k = await keyOf()
+      const parts = []
+      for (const row of snapshot.rows) {
+        if (!COOKIE_HOSTS.includes(row.host_key)) continue
+        if (row.has_expires && Number(row.expires_utc) / 1000 - 11644473600000 <= Date.now()) continue
+        const value = decodeCookie(row, snapshot.version, k)
+        if (!/^[!#$%&'*+.^_`|~\w-]+$/.test(row.name) || /[\x00-\x20\x7f;,]/.test(value)) continue
+        if (value) parts.push(`${row.name}=${value}`)
+      }
+      if (parts.length) out.push({ profile, cookie: parts.join("; ") })
+    } catch {
+      continue // 单个资料解密失败只跳过它
+    }
+    if (signal?.aborted) break
+  }
+  if (!out.length) {
+    throw new BrowserCookieError("默认浏览器的所有资料里都没有读到超算的登录会话；请在默认浏览器的普通窗口里登录 scnet.cn 并打开任意页面，然后重试")
+  }
+  return out
 }
 
+// =============================================================================
+// 账号
+// =============================================================================
 // =============================================================================
 // 账号
 // =============================================================================
@@ -789,11 +839,17 @@ function hooks(client) {
                   }
                 } else {
                   try {
-                    cookie = String(await readBrowserSession()).trim()
-                    if (!cookie) throw new BrowserCookieError("浏览器里没有读到超算的登录会话")
-                    // 读到了就验证一次，确保这枚 Cookie 真能查额度
-                    if (tier === "tokenplan") await tokenPlanPlans(cookie)
-                    else await freeQuotaResources(cookie)
+                    // 浏览器自动读取：最近使用的资料优先；读不到不阻断登录
+                    const candidates = await browserCookieCandidates()
+                    let picked = null
+                    for (const cand of candidates) {
+                      if (tier === "tokenplan") await tokenPlanPlans(cand.cookie)
+                      else await freeQuotaResources(cand.cookie)
+                      picked = cand
+                      break // 第一份能查额度的就用它
+                    }
+                    if (!picked) throw new BrowserCookieError("浏览器资料里没有找到有效的超算登录会话")
+                    cookie = picked.cookie
                   } catch (e) {
                     // 自动读取失败不阻断登录：模型仍然可用，额度稍后再补
                     cookie = ""
@@ -867,7 +923,7 @@ export const _internal = {
   usageFromTokenPlan,
   usageFromFree,
   readUsage,
-  readBrowserSession,
+  browserCookieCandidates,
   saveWebCookie,
   contextLimitOf,
   checkTier,
