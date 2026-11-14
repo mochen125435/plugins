@@ -1324,7 +1324,15 @@ function hooks(client) {
 
           // 分组决定上下文上限：paygo 600K / default（Lite）256K。
           // 读不到分组时交给 contextLimitOf 按 Lite 保守处理。
-          const keyInfo = await fetchKeyInfo(base, webTokenOf(auth), auth.key)
+          //
+          // 网页令牌快过期就先续一次：否则这里读不到分组，
+          // 付费账号会被临时按 256K 压缩，直到 usage 那边把令牌续上。
+          let forGroup = auth
+          if (isStale(auth) && credentialsOf(auth)) {
+            const got = await renewAndSave(client, ID, auth, base)
+            if (got.ok) forGroup = got.auth
+          }
+          const keyInfo = await fetchKeyInfo(base, webTokenOf(forGroup), auth.key)
           const groupCode = keyInfo?.group
 
           const out = {}
