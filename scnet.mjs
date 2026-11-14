@@ -736,8 +736,8 @@ function collectSetCookie(res, jar) {
   return jar
 }
 
-/** jarToHeader 把 jar 转成 Cookie 请求头的值。 */
-function jarToHeader(jar) {
+/** buildCookieHead 把 jar 转成 Cookie 请求头的值。 */
+function buildCookieHead(jar) {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ")
 }
 
@@ -801,7 +801,7 @@ async function ssoLogin(phone, password) {
     redirect: "manual",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      ...cookieHeaders(jarToHeader(jar)),
+      ...cookieHeaders(buildCookieHead(jar)),
       "User-Agent": "magpie-scnet",
     },
     body: form.toString(),
@@ -814,7 +814,7 @@ async function ssoLogin(phone, password) {
     const loc = res.headers.get("location")
     if (!loc) break
     const hopHeaders = { "User-Agent": "magpie-scnet" }
-    if (jar.size) hopHeaders.Cookie = jarToHeader(jar)
+    if (jar.size) hopHeaders.Cookie = buildCookieHead(jar)
     res = await fetch(loc.startsWith("/") ? new URL(loc, CONSOLE_BASE).href : loc, {
       redirect: "manual",
       headers: hopHeaders,
@@ -823,7 +823,7 @@ async function ssoLogin(phone, password) {
     collectSetCookie(res, jar)
   }
 
-  const header = jarToHeader(jar)
+  const header = buildCookieHead(jar)
   // 会话 Cookie 至少要有 Token；没有就说明登录没成功
   if (!/(^|[&; ])Token=/.test(header)) {
     throw new Error("SSO 登录未建立会话（可能密码错误、需要验证码或账号被锁定）")
