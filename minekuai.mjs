@@ -626,6 +626,42 @@ function dailyWindow(data, today = localDate()) {
 }
 
 /**
+ * narrowUsage 按 key 的分组，只留下这把 key 真正能用到的那个额度桶。
+ *
+ * /app/token 是账号级数据，付费与免费两个桶都会返回；
+ * 但一把 key 只走其中一边（站点「分组」决定），把另一边也画出来会造成误读：
+ *   - 付费 key 的卡片上出现「免费按量额度」，像是免费额度也归它用；
+ *   - 免费 key 的卡片上出现「付费按量 token 8%」，像是它在烧付费余额。
+ * 更糟的是 usageFrom 会把两个桶相加当余额，免费 key 会显示成 9 亿多，
+ * 而它实际只能用免费那 7000 万。
+ *
+ * @param {object} out    usageFrom 的结果（就地修改）
+ * @param {object} data   /app/token 的 data
+ * @param {string} group  paygo / default；其它值原样返回，不裁剪
+ */
+function narrowUsage(out, data, group) {
+  if (group !== "paygo" && group !== "default") return out
+
+  const drop = group === "paygo" ? "免费按量额度" : "付费按量 token"
+  out.windows = (out.windows || []).filter((w) => w?.name !== drop)
+  out.plan = groupNameOf(group)
+
+  // 余额也只算这一组：付费用 paid.balance，免费用站点给的 remaining
+  // （remaining = 今日可用 + 永久额度，与站点卡片上的「可用 7000 万」一致）
+  const left =
+    group === "paygo" ? looseNum(data?.paid?.balance) : looseNum(data?.remaining)
+  if (left > 0) out.balance = `${fmtTokens(left)} token`
+  else delete out.balance
+
+  // usageFrom 会在付费桶用完时写一条「付费套餐用完」的错误；
+  // 免费 key 根本没碰付费桶，这条错误与它无关，必须去掉。
+  if (group === "default" && out.error && String(out.error).includes("付费")) {
+    delete out.error
+  }
+  return out
+}
+
+/**
  * groupWindow 做「额度分组」行：说明这把 key 扣哪种额度、按多少上下文跑。
  *
  * 为什么必须单独一行（aside，只展示不参与路由）：
@@ -698,6 +734,8 @@ async function readUsage(client, id, auth, base) {
   // 只会悄悄按低的那组跑，所以必须显式展示出来。
   try {
     const info = await fetchKeyInfo(base, r.token, auth.key)
+    // 先按分组裁掉用不上的额度桶，再挂分组说明行
+    narrowUsage(out, r.data, info?.group)
     const win = groupWindow(info, r.data)
     if (win) out.windows.push(win)
   } catch {
@@ -1375,6 +1413,7 @@ export const _internal = {
   fetchKeyInfo,
   groupNameOf,
   groupWindow,
+  narrowUsage,
   GROUP_CONTEXT,
   GROUP_CACHE_TTL,
   keyInfoCache,

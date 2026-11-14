@@ -411,7 +411,7 @@ test("loader 给出 magpie 需要的 baseURL 与 apiKey", async () => {
 
 // ---- 额度 --------------------------------------------------------------------
 
-test("usage 用网页令牌 + clientid 读出两个额度窗口", async () => {
+test("usage 用网页令牌 + clientid 只读出这把 key 对应的额度窗口", async () => {
   state.reset()
   seen.length = 0
   const p = await plugin()
@@ -420,20 +420,20 @@ test("usage 用网页令牌 + clientid 读出两个额度窗口", async () => {
   const u = await p.auth.usage(async () => auth)
 
   assert.equal(u.plan, "按量付费")
-  // 分组 + 两个额度窗口 + 鱼币余额 + 今日用量 + 签到状态
-  assert.equal(u.windows.length, 6)
+  // 付费 key：只留付费桶 + 分组 + 鱼币 + 今日用量 + 签到状态
+  assert.equal(u.windows.length, 5)
   assert.equal(u.windows[0].name, "付费按量 token")
-  assert.equal(u.windows[1].name, "免费按量额度")
-  assert.equal(u.windows[2].name, "额度分组")
-  assert.match(u.windows[2].display, /按量付费/)
-  assert.match(u.windows[2].display, /600K/)
-  assert.equal(u.windows[3].name, "鱼币余额")
-  assert.equal(u.windows[3].display, "40 鱼币")
-  assert.equal(u.windows[4].name, "今日用量")
+  assert.equal(u.windows[1].name, "额度分组")
+  assert.match(u.windows[1].display, /按量付费/)
+  assert.match(u.windows[1].display, /600K/)
+  assert.equal(u.windows[2].name, "鱼币余额")
+  assert.equal(u.windows[2].display, "40 鱼币")
+  assert.equal(u.windows[3].name, "今日用量")
   // 1156619 + 4533632 + 9462 = 5,699,713 → 569.97 万
-  assert.equal(u.windows[4].display, "569.97 万 token · 17 次调用")
-  assert.equal(u.windows[5].name, "每日签到")
-  assert.equal(u.balance, "10.1 亿 token")
+  assert.equal(u.windows[3].display, "569.97 万 token · 17 次调用")
+  assert.equal(u.windows[4].name, "每日签到")
+  // 余额只算付费桶，不再把免费额度加进来
+  assert.equal(u.balance, "10 亿 token")
   assert.equal(u.error, undefined)
 
   // 关键：请求带回 clientid 头，且用的是网页令牌而不是 API Key
@@ -441,6 +441,25 @@ test("usage 用网页令牌 + clientid 读出两个额度窗口", async () => {
   assert.ok(q, "应当请求 /app/token")
   assert.equal(q.clientid, CLIENT_ID)
   assert.equal(q.auth, `Bearer ${GOOD_TOKEN}`)
+})
+
+test("usage 在 Lite 免费分组只显示免费额度与免费余额", async () => {
+  state.reset()
+  state.keyGroup = "default"
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  const u = await p.auth.usage(async () => auth)
+
+  // 免费 key 不该看到付费桶，也不该把付费余额算进余额
+  assert.deepEqual(
+    u.windows.map((w) => w.name),
+    ["免费按量额度", "额度分组", "鱼币余额", "今日用量", "每日签到"]
+  )
+  assert.match(u.windows[1].display, /Lite 免费/)
+  assert.match(u.windows[1].display, /256K/)
+  assert.equal(u.plan, "Lite 免费")
+  assert.equal(u.balance, "1,000 万 token")
 })
 
 test("usage 在没填网页令牌时给出可操作的提示", async () => {
@@ -495,9 +514,9 @@ test("令牌过期但存了密码时，自动续期并重试成功", async () =>
   }
   const u = await p.auth.usage(async () => auth)
 
-  // 额度照常读出（分组 + 两个额度 + 鱼币 + 今日用量 + 签到），并标记这次续过期
-  assert.equal(u.windows.length, 6)
-  assert.equal(u.balance, "10.1 亿 token")
+  // 额度照常读出（分组 + 付费桶 + 鱼币 + 今日用量 + 签到），并标记这次续过期
+  assert.equal(u.windows.length, 5)
+  assert.equal(u.balance, "10 亿 token")
   assert.equal(u.renewed, true)
   assert.equal(u.signIn, undefined)
 
