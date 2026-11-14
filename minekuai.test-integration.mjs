@@ -10,7 +10,7 @@ import { test, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 
-import { MinekuaiPlugin } from "./minekuai.mjs"
+import { MinekuaiPlugin, _internal } from "./minekuai.mjs"
 
 const GOOD_KEY = "sk-fake-test-0001"
 const GOOD_TOKEN = "fake-token-0001"
@@ -108,10 +108,14 @@ const state = {
   validTokens: null, // null = 只认 GOOD_TOKEN
   checkinReply: "already", // "ok" | "already" | "fail"
   loginFails: false,
+  keyGroup: "paygo", // 密钥分组：paygo（付费按量）/ default（Lite 免费）
   reset() {
     this.validTokens = null
     this.checkinReply = "already"
     this.loginFails = false
+    this.keyGroup = "paygo"
+    // 分组信息有 10 分钟缓存，切换假分组后要清掉，否则读到上一个用例的值
+    _internal.keyInfoCache.clear()
   },
 }
 
@@ -161,6 +165,29 @@ before(async () => {
         return send(200, { code: 401, data: null, msg: "认证失败，无法访问系统资源" })
       }
       return send(200, TOKEN_BODY)
+    }
+
+    // API 密钥列表：判断当前 key 属于哪个分组（决定上下文与扣哪种额度）
+    if (req.url === "/app/apikeys") {
+      if (!tokenOk(auth) || clientid !== CLIENT_ID) {
+        return send(200, { code: 401, data: null, msg: "认证失败，无法访问系统资源" })
+      }
+      return send(200, {
+        code: 200,
+        msg: "操作成功",
+        data: [
+          {
+            id: "2121078704437501954",
+            name: "magpie",
+            keyPrefix: GOOD_KEY.slice(0, 8),
+            status: "0",
+            groupCode: state.keyGroup,
+            modelAllow: "deepseek-v4.1-flash-1017",
+            quotaPoints: null,
+            usedPoints: "0.0000",
+          },
+        ],
+      })
     }
 
     // 每日用量
@@ -344,6 +371,35 @@ test("provider.models 用 API Key 列出真实模型", async () => {
   assert.equal(models["deepseek-v4.1-flash-1017"].api.npm, "@ai-sdk/openai-compatible")
 })
 
+test("provider.models 按付费分组的 600K 声明上下文", async () => {
+  state.reset()
+  state.keyGroup = "paygo"
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  const models = await p.provider.models({ models: {} }, { auth })
+  assert.equal(models["deepseek-v4.1-flash-1017"].limit.context, 600_000)
+})
+
+test("provider.models 在 Lite 免费分组按 256K 声明上下文", async () => {
+  state.reset()
+  state.keyGroup = "default"
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
+
+  const models = await p.provider.models({ models: {} }, { auth })
+  assert.equal(models["deepseek-v4.1-flash-1017"].limit.context, 256_000)
+})
+
+test("没有网页令牌、读不到分组时按 256K 保守声明", async () => {
+  state.reset()
+  const p = await plugin()
+  const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base } }
+
+  const models = await p.provider.models({ models: {} }, { auth })
+  assert.equal(models["deepseek-v4.1-flash-1017"].limit.context, 256_000)
+})
+
 test("loader 给出 magpie 需要的 baseURL 与 apiKey", async () => {
   const p = await plugin()
   const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base } }
@@ -356,6 +412,7 @@ test("loader 给出 magpie 需要的 baseURL 与 apiKey", async () => {
 // ---- 额度 --------------------------------------------------------------------
 
 test("usage 用网页令牌 + clientid 读出两个额度窗口", async () => {
+  state.reset()
   seen.length = 0
   const p = await plugin()
   const auth = { type: "api", key: GOOD_KEY, metadata: { baseURL: base, webToken: GOOD_TOKEN } }
@@ -363,16 +420,19 @@ test("usage 用网页令牌 + clientid 读出两个额度窗口", async () => {
   const u = await p.auth.usage(async () => auth)
 
   assert.equal(u.plan, "按量付费")
-  // 两个额度窗口 + 鱼币余额 + 今日用量 + 签到状态
-  assert.equal(u.windows.length, 5)
+  // 分组 + 两个额度窗口 + 鱼币余额 + 今日用量 + 签到状态
+  assert.equal(u.windows.length, 6)
   assert.equal(u.windows[0].name, "付费按量 token")
   assert.equal(u.windows[1].name, "免费按量额度")
-  assert.equal(u.windows[2].name, "鱼币余额")
-  assert.equal(u.windows[2].display, "40 鱼币")
-  assert.equal(u.windows[3].name, "今日用量")
+  assert.equal(u.windows[2].name, "额度分组")
+  assert.match(u.windows[2].display, /按量付费/)
+  assert.match(u.windows[2].display, /600K/)
+  assert.equal(u.windows[3].name, "鱼币余额")
+  assert.equal(u.windows[3].display, "40 鱼币")
+  assert.equal(u.windows[4].name, "今日用量")
   // 1156619 + 4533632 + 9462 = 5,699,713 → 569.97 万
-  assert.equal(u.windows[3].display, "569.97 万 token · 17 次调用")
-  assert.equal(u.windows[4].name, "每日签到")
+  assert.equal(u.windows[4].display, "569.97 万 token · 17 次调用")
+  assert.equal(u.windows[5].name, "每日签到")
   assert.equal(u.balance, "10.1 亿 token")
   assert.equal(u.error, undefined)
 
@@ -435,8 +495,8 @@ test("令牌过期但存了密码时，自动续期并重试成功", async () =>
   }
   const u = await p.auth.usage(async () => auth)
 
-  // 额度照常读出，并标记这次续过期
-  assert.equal(u.windows.length, 5)
+  // 额度照常读出（分组 + 两个额度 + 鱼币 + 今日用量 + 签到），并标记这次续过期
+  assert.equal(u.windows.length, 6)
   assert.equal(u.balance, "10.1 亿 token")
   assert.equal(u.renewed, true)
   assert.equal(u.signIn, undefined)

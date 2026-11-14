@@ -22,6 +22,12 @@ const {
   localDate,
   WEB_TOKEN_TTL,
   CLIENT_ID,
+  contextLimitOf,
+  GROUP_CONTEXT,
+  groupNameOf,
+  groupWindow,
+  fmtK,
+  runtimeModel,
 } = _internal
 
 // ---- 地址规整 ----------------------------------------------------------------
@@ -292,4 +298,65 @@ test("dailyWindow 没有数据时返回 null，不编造 0", () => {
   assert.equal(dailyWindow({}), null)
   assert.equal(dailyWindow({ daily: [] }), null)
   assert.equal(dailyWindow(undefined), null)
+})
+
+// ---- 密钥分组与上下文 -------------------------------------------------------
+
+test("contextLimitOf 按分组给出不同上下文：paygo 600K / Lite 256K", () => {
+  // 付费按量：站点硬上限 640K，按 600K 声明留 40K 给提前压缩
+  assert.equal(contextLimitOf("deepseek-v4.1-flash-1017", "paygo"), 600_000)
+  // Lite 免费：站点标 256K，原样声明
+  assert.equal(contextLimitOf("deepseek-v4.1-flash-1017", "default"), 256_000)
+  // 分组读不到时按 Lite 保守处理，绝不按 600K 放开
+  assert.equal(contextLimitOf("deepseek-v4.1-flash-1017", undefined), 256_000)
+  assert.equal(contextLimitOf("deepseek-v4.1-flash-1017", "unknown-group"), 256_000)
+  // 非 DeepSeek 模型没有实测数据，保持 0
+  assert.equal(contextLimitOf("glm-4.6", "paygo"), 0)
+})
+
+test("GROUP_CONTEXT 记录站点标称值与实际的压缩值", () => {
+  assert.equal(GROUP_CONTEXT.paygo.site, 640_000)
+  assert.equal(GROUP_CONTEXT.paygo.context, 600_000)
+  assert.equal(GROUP_CONTEXT.default.site, 256_000)
+  assert.equal(GROUP_CONTEXT.default.context, 256_000)
+  assert.equal(groupNameOf("paygo"), "按量付费")
+  assert.equal(groupNameOf("default"), "Lite 免费")
+  // 未知分组不吞掉信息，原样返回 code
+  assert.equal(groupNameOf("vip"), "vip")
+})
+
+test("fmtK 把上下文写成 K，非法值给「未知」", () => {
+  assert.equal(fmtK(600_000), "600K")
+  assert.equal(fmtK(256_000), "256K")
+  assert.equal(fmtK(0), "未知")
+  assert.equal(fmtK(undefined), "未知")
+})
+
+test("groupWindow 显示分组与两组上下文，付费组不报警", () => {
+  const w = groupWindow({ group: "paygo" }, { paid: { balance: "943829213" } })
+  assert.equal(w.aside, true)
+  assert.match(w.display, /按量付费/)
+  assert.match(w.display, /640K/)
+  assert.match(w.display, /600K/)
+  assert.doesNotMatch(w.display, /不会扣付费 token/)
+})
+
+test("groupWindow 在 Lite 组但账号有付费余额时给出混用提醒", () => {
+  const w = groupWindow({ group: "default" }, { paid: { balance: "943829213" } })
+  assert.match(w.display, /Lite 免费/)
+  assert.match(w.display, /256K/)
+  assert.match(w.display, /不会扣付费 token/)
+})
+
+test("groupWindow 读不到分组时说明按 256K 保守声明", () => {
+  const w = groupWindow(null, {})
+  assert.match(w.display, /未能读取密钥分组/)
+  assert.match(w.display, /256K/)
+})
+
+test("runtimeModel 把分组上下文写进 limit.context", () => {
+  const paygo = runtimeModel({ id: "deepseek-v4.1-flash-1017", name: "DeepSeek" }, "https://minekuai.cn/v1", "minekuai", "paygo")
+  assert.equal(paygo.limit.context, 600_000)
+  const free = runtimeModel({ id: "deepseek-v4.1-flash-1017", name: "DeepSeek" }, "https://minekuai.cn/v1", "minekuai", "default")
+  assert.equal(free.limit.context, 256_000)
 })

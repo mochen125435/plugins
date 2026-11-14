@@ -155,6 +155,15 @@ async function httpJson(
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined)
 
 /**
+ * looseNum 比 num 宽松一档：数字字符串也认（站点有的接口把金额给成 "943829213"）。
+ * 只在「判断有没有余额」这种展示逻辑里用，不参与精确计算。
+ */
+const looseNum = (v) => {
+  const n = typeof v === "string" ? Number(v) : v
+  return typeof n === "number" && Number.isFinite(n) ? n : 0
+}
+
+/**
  * fmtTokens 把 token 数压缩成中文可读单位：
  *   1_000_000_000 → "10 亿"
  *   12_500_000    → "1250 万"
@@ -213,30 +222,117 @@ async function fetchModels(base, key) {
   return out
 }
 
-/**
- * runtimeModel 生成 magpie 需要的模型对象。
- * 麦块云是纯文本对话网关，不提供图片/音频，也不公开模型的推理档位，
- * 所以能力位保守设置，价格为 0（magpie 自己按 token 统计算费用）。
- *
- * 上下文上限必须声明：站点实测 DeepSeek 系列的硬上限是 640,000 tokens，
- * 超过后返回 400（"This model's maximum context length is 640000 tokens"）。声明 600K，
- * 给 magpie 的自动压缩留出余量，保证在硬上限之前触发，而不是贴着边界。
- * 如果声明为 0（未知），magpie 不知道该提前压缩会话，会把整段历史
- * 直接发过去，长会话必然 400。模型名以 deepseek 开头的按 640K 声明，
- * 其他模型没有实测数据，保持 0 让 magpie 自己兜底。
- */
-const CONTEXT_LIMITS = [
-  { match: /^deepseek/i, context: 600_000 },
-]
+// =============================================================================
+// 密钥分组
+// =============================================================================
 
-function contextLimitOf(id) {
-  for (const { match, context } of CONTEXT_LIMITS) {
-    if (match.test(String(id))) return context
+/**
+ * fetchKeyInfo 找出当前 API Key 在站点上属于哪个分组（决定扣哪种额度、多少上下文）。
+ *
+ * 站点依据（2026-11-14 实测）：
+ *   GET /app/apikeys（网页令牌 + clientid）返回每把 key 的：
+ *     { id, name, keyPrefix, groupCode, modelAllow, quotaPoints, usedPoints, ... }
+ *   keyPrefix 是密钥前 8 位（例如 sk-qTCn4），据此把配置里的 sk-… 对上号；
+ *   groupCode 为 paygo（按量付费）或 default（Lite 免费）。
+ *
+ * 结果缓存 10 分钟：分组是站点侧设置，不会秒级变化，
+ * 免得每次列模型、查额度都多打一个请求。
+ *
+ * 读不到（没填网页令牌 / 令牌过期 / 网络抖动）时返回 null，
+ * 调用方按 Lite 的 256K 保守声明模型上下文，额度照常读取。
+ */
+const keyInfoCache = new Map()
+
+async function fetchKeyInfo(base, webToken, apiKey) {
+  if (!webToken || !apiKey) return null
+
+  const prefix = String(apiKey).slice(0, 8)
+  const cacheKey = `${base}|${prefix}`
+  const hit = keyInfoCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < GROUP_CACHE_TTL) return hit.info
+
+  try {
+    const body = await httpJson(base, "/app/apikeys", {
+      token: webToken,
+      headers: { clientid: CLIENT_ID },
+    })
+    const list = Array.isArray(body?.data) ? body.data : []
+    const mine = list.find(
+      (k) =>
+        typeof k?.keyPrefix === "string" &&
+        k.keyPrefix &&
+        String(apiKey).startsWith(k.keyPrefix)
+    )
+    const info = mine
+      ? {
+          id: mine.id,
+          name: mine.name || "",
+          group: mine.groupCode || "default",
+          modelAllow: String(mine.modelAllow ?? ""),
+          quotaPoints: mine.quotaPoints ?? null,
+          usedPoints: mine.usedPoints ?? null,
+        }
+      : null
+    keyInfoCache.set(cacheKey, { at: Date.now(), info })
+    return info
+  } catch {
+    // 分组读不到不算致命：额度与模型都还能用，只是上下文按保守值声明
+    return null
   }
-  return 0
 }
 
-function runtimeModel(m, url, providerID) {
+/** groupNameOf 返回分组的中文名；未知分组原样返回 code，不吞掉信息。 */
+function groupNameOf(code) {
+  return GROUP_CONTEXT[String(code ?? "")]?.name || String(code || "未知")
+}
+
+/**
+ * 上下文上限按「密钥所在分组」区分，两组不一样，不能混用。
+ *
+ * 站点依据（2026-11-14 实测）：
+ *   - GET /app/groups 返回两个分组：
+ *       default（Lite 免费）：「免费档：同时 1 个会话，没有额外会话；上下文 256K」
+ *       paygo  （按量付费）：扣付费 token，不限会话数；控制台「按量额度」页标 640K
+ *   - GET /app/apikeys 返回每把 key 的 groupCode，据此判断这把 key 走哪组额度。
+ *   - GET /app/token 的 paid / permanent 两个桶分别对应 paygo 与 default。
+ *
+ * 声明值：
+ *   paygo  → 600,000。站点硬上限 640,000，留 40K 给 magpie 提前压缩，
+ *            避免贴着边界被 400（"maximum context length is 640000 tokens"）。
+ *   default→ 256,000。Lite 免费档的硬上限，没有余量可留。
+ *   未知分组（没填网页令牌，读不到 /app/apikeys）时按 Lite 的 256K 保守声明，
+ *   宁可早压缩，也不要发出必然 400 的长请求。
+ *
+ * 只有 DeepSeek 系列有实测数据；其它模型返回 0，让 magpie 自己兜底。
+ */
+const GROUP_CONTEXT = {
+  paygo: { name: "按量付费", context: 600_000, site: 640_000 },
+  default: { name: "Lite 免费", context: 256_000, site: 256_000 },
+}
+
+// 分组信息缓存时间：分组是站点侧设置，不会秒级变化，10 分钟足够
+const GROUP_CACHE_TTL = 10 * 60 * 1000
+
+/**
+ * contextLimitOf 返回某个模型在当前分组下的上下文上限。
+ *
+ * @param {string} id        模型 id
+ * @param {string} groupCode 密钥分组：paygo / default；空值按 default 处理
+ */
+function contextLimitOf(id, groupCode) {
+  if (!/^deepseek/i.test(String(id))) return 0
+  const g = GROUP_CONTEXT[String(groupCode ?? "")] || GROUP_CONTEXT.default
+  return g.context
+}
+
+/** fmtK 把 token 数写成「640K」这种紧凑形式，用于展示分组上下文。 */
+function fmtK(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v) || v <= 0) return "未知"
+  return `${Math.round(v / 1000)}K`
+}
+
+function runtimeModel(m, url, providerID, groupCode) {
   return {
     id: m.id,
     providerID,
@@ -246,7 +342,7 @@ function runtimeModel(m, url, providerID) {
     headers: {},
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: contextLimitOf(m.id), output: 0 },
+    limit: { context: contextLimitOf(m.id, groupCode), output: 0 },
     capabilities: {
       temperature: true,
       reasoning: false,
@@ -530,6 +626,47 @@ function dailyWindow(data, today = localDate()) {
 }
 
 /**
+ * groupWindow 做「额度分组」行：说明这把 key 扣哪种额度、按多少上下文跑。
+ *
+ * 为什么必须单独一行（aside，只展示不参与路由）：
+ *   麦块云的付费按量与 Lite 免费是两套互不相通的额度，模型上下文也不同
+ *   （640K / 256K）。key 选错分组不会报错，只会悄悄按低的那组跑、
+ *   且不扣你买的付费 token —— 这种「看起来正常、实际吃亏」的状态
+ *   必须让人一眼看到。
+ *
+ * @param {object|null} info fetchKeyInfo 的结果；null 表示读不到分组
+ * @param {object} data /app/token 的 data，用来判断两边的余额
+ */
+function groupWindow(info, data) {
+  if (!info) {
+    return {
+      name: "额度分组",
+      used: 0,
+      remaining: 100,
+      aside: true,
+      display: "未能读取密钥分组（需网页令牌）；模型上下文按 Lite 的 256K 保守声明",
+    }
+  }
+
+  const g = GROUP_CONTEXT[info.group] || GROUP_CONTEXT.default
+  const head = `${groupNameOf(info.group)} · 上下文 ${fmtK(g.site)}（magpie 按 ${fmtK(g.context)} 压缩）`
+
+  // 混用提醒：key 在 Lite 分组，但账号里明明有付费 token 余额
+  const paidLeft = looseNum(data?.paid?.balance)
+  if (info.group === "default" && paidLeft > 0) {
+    return {
+      name: "额度分组",
+      used: 0,
+      remaining: 100,
+      aside: true,
+      display: `${head}；此 key 不会扣付费 token（余额 ${fmtTokens(paidLeft)}），需在网站密钥设置里改分组`,
+    }
+  }
+
+  return { name: "额度分组", used: 0, remaining: 100, aside: true, display: head }
+}
+
+/**
  * readUsage 是 auth.usage 钩子的主体。
  *
  * 负责三件事：
@@ -555,6 +692,17 @@ async function readUsage(client, id, auth, base) {
   const out = usageFrom(r.data, user)
   // 只有真的续过令牌才点亮这个标记，免得每行都写「已续期」
   if (r.renewed) out.renewed = true
+
+  // 分组行：让「这把 key 扣哪种额度、按多少上下文跑」直接可见。
+  // 付费按量与 Lite 免费两组的模型上下文不同（640K / 256K），混用了不会报错，
+  // 只会悄悄按低的那组跑，所以必须显式展示出来。
+  try {
+    const info = await fetchKeyInfo(base, r.token, auth.key)
+    const win = groupWindow(info, r.data)
+    if (win) out.windows.push(win)
+  } catch {
+    // 分组读不到不影响额度显示
+  }
 
   // 鱼币余额行：和 token 是两套单位，单独展示
   try {
@@ -1174,9 +1322,14 @@ function hooks(client) {
           const listed = await fetchModels(base, auth.key)
           if (!Object.keys(listed).length) return provider.models
 
+          // 分组决定上下文上限：paygo 600K / default（Lite）256K。
+          // 读不到分组时交给 contextLimitOf 按 Lite 保守处理。
+          const keyInfo = await fetchKeyInfo(base, webTokenOf(auth), auth.key)
+          const groupCode = keyInfo?.group
+
           const out = {}
           for (const m of Object.values(listed)) {
-            out[m.id] = runtimeModel(m, base + "/v1", ID)
+            out[m.id] = runtimeModel(m, base + "/v1", ID, groupCode)
           }
           return out
         } catch (e) {
@@ -1211,6 +1364,13 @@ export const _internal = {
   fmtTokens,
   pct,
   fetchModels,
+  fetchKeyInfo,
+  groupNameOf,
+  groupWindow,
+  GROUP_CONTEXT,
+  GROUP_CACHE_TTL,
+  keyInfoCache,
+  fmtK,
   runtimeModel,
   contextLimitOf,
   placeholderModel,
