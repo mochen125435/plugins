@@ -139,11 +139,11 @@ async function fetchModels(key) {
  *
  * 上下文上限：SCNet 的 DeepSeek-V4.1-Flash-1017-Event 与麦块云同源
  * （同为 DeepSeek V4.1 Flash 部署），站点未公布上限；麦块云同款模型
- * 实测硬上限 640,000 tokens，按 600,000 声明，给 magpie 的自动压缩留出余量。
+ * 实测 640,000 tokens，按同一数值声明，让 magpie 提前压缩会话。
  * GLM-5.3-Flash 无实测数据，保持 0。
  */
 const CONTEXT_LIMITS = [
-  { match: /^deepseek/i, context: 600_000 },
+  { match: /^deepseek/i, context: 640_000 },
 ]
 
 function contextLimitOf(id) {
