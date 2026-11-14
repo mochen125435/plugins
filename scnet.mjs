@@ -451,7 +451,7 @@ async function readUsage(client, id, auth, tier) {
   }
   // 所有候选都无效：浏览器里的会话也是过期的，明确告诉用户去官网重新登录
   const hint = candidates.length
-    ? `已尝试默认浏览器的 ${candidates.length} 份资料，会话均未登录`
+    ? `已尝试默认浏览器的 ${candidates.length} 份资料，会话均未登录（读到的 Cookie：${candidates.flatMap((c) => c.names).join(", ")}）`
     : lastErr
   return {
     user,
@@ -514,9 +514,9 @@ async function readSCNetRows(path) {
     const version = Number(db.prepare("SELECT value FROM meta WHERE key = 'version'").get()?.value)
     if (!Number.isInteger(version) || version < 1) throw new Error("Unsupported schema")
     const query = db.prepare(`SELECT host_key, name, value, encrypted_value, path, expires_utc, has_expires
-      FROM cookies WHERE host_key IN (?, ?, ?, ?) LIMIT 64`)
+      FROM cookies WHERE host_key LIKE '%scnet.cn' LIMIT 128`)
     query.setReadBigInts?.(true)
-    const rows = query.all(...COOKIE_HOSTS)
+    const rows = query.all()
     if (rows.length > 64) throw new Error("Too many cookies")
     return { version, rows }
   } finally {
@@ -662,7 +662,7 @@ async function browserCookieCandidates({ signal } = {}) {
         if (!/^[!#$%&'*+.^_`|~\w-]+$/.test(row.name) || /[\x00-\x20\x7f;,]/.test(value)) continue
         if (value) parts.push(`${row.name}=${value}`)
       }
-      if (parts.length) out.push({ profile, cookie: parts.join("; ") })
+      if (parts.length) out.push({ profile, cookie: parts.join("; "), names: parts.map((x) => x.split("=")[0]) })
     } catch {
       continue // 单个资料解密失败只跳过它
     }
