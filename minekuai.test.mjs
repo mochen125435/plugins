@@ -358,8 +358,16 @@ test("groupWindow 读不到分组时说明按 256K 保守声明", () => {
 test("runtimeModel 把分组上下文写进 limit.context", () => {
   const paygo = runtimeModel({ id: "deepseek-v4.1-flash-1017", name: "DeepSeek" }, "https://minekuai.cn/v1", "minekuai", "paygo")
   assert.equal(paygo.limit.context, 600_000)
+  // 付费组用真实模型名当 id
+  assert.equal(paygo.id, "deepseek-v4.1-flash-1017")
+
   const free = runtimeModel({ id: "deepseek-v4.1-flash-1017", name: "DeepSeek" }, "https://minekuai.cn/v1", "minekuai", "default")
   assert.equal(free.limit.context, 256_000)
+  // 免费组用 -lite 后缀区分，避免和付费组同名互相覆盖；
+  // 发给上游的 api.id 仍是真实模型名
+  assert.equal(free.id, "deepseek-v4.1-flash-1017-lite")
+  assert.equal(free.api.id, "deepseek-v4.1-flash-1017")
+  assert.match(free.name, /Lite 256K/)
 })
 
 // ---- 按分组裁剪额度显示 -----------------------------------------------------
@@ -376,6 +384,19 @@ test("narrowUsage 付费组只留付费桶，余额只算付费", () => {
   assert.deepEqual(out.windows.map((w) => w.name), ["付费按量 token"])
   assert.equal(out.plan, "按量付费")
   assert.equal(out.balance, "900 token")
+})
+
+test("narrowUsage 免费组补出今日免费额度那一行", () => {
+  const data = {
+    ...BOTH_BUCKETS,
+    today: { used: 5_000_000, remaining: 45_000_000 },
+  }
+  const out = usageFrom(data, "u")
+  narrowUsage(out, data, "default")
+  const names = out.windows.map((w) => w.name)
+  assert.deepEqual(names, ["今日免费额度", "免费按量额度"])
+  assert.match(out.windows[0].display, /共 5,000 万/)
+  assert.match(out.windows[0].display, /剩余 4,500 万/)
 })
 
 test("narrowUsage 免费组只留免费桶，余额用站点 remaining（今日 + 永久）", () => {

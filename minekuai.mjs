@@ -333,10 +333,16 @@ function fmtK(n) {
 }
 
 function runtimeModel(m, url, providerID, groupCode) {
+  // 免费组（Lite）用带后缀的模型 id，和付费组区分开：
+  // 两组调用的是同一个上游模型，但上下文不同（256K / 640K）。
+  // magpie 的模型上下文是 provider 级的，同名模型只会保留一条，
+  // 两个账号并存时会互相覆盖；加上 -lite 后缀后是两条独立模型，
+  // 各自声明各自的上下文。api.id 仍是真实模型名，请求不受影响。
+  const lite = groupCode === "default"
   return {
-    id: m.id,
+    id: lite ? `${m.id}-lite` : m.id,
     providerID,
-    name: m.name,
+    name: lite ? `${m.name}（Lite 256K）` : m.name,
     api: { id: m.id, url, npm: CHAT },
     status: "active",
     headers: {},
@@ -645,6 +651,24 @@ function narrowUsage(out, data, group) {
   const drop = group === "paygo" ? "免费按量额度" : "付费按量 token"
   out.windows = (out.windows || []).filter((w) => w?.name !== drop)
   out.plan = groupNameOf(group)
+
+  // 免费额度其实是两块：今天可兑换的 5000 万 + 永久的 2000 万。
+  // usageFrom 只画了 permanent 那块，卡片上就只剩「共 2,000 万」，
+  // 和站点「可用 7000 万（今日 5000 万 · 永久 2000 万）」对不上。
+  // 这里把今日那块补成单独一行，放在永久额度前面。
+  if (group === "default") {
+    const t = data?.today
+    const used = looseNum(t?.used)
+    const todayLeft = looseNum(t?.remaining)
+    const total = used + todayLeft
+    if (total > 0) {
+      out.windows.unshift({
+        name: "今日免费额度",
+        used: pct(used, total),
+        display: `已用 ${fmtTokens(used)} / 共 ${fmtTokens(total)}（剩余 ${fmtTokens(todayLeft)}）`,
+      })
+    }
+  }
 
   // 余额也只算这一组：付费用 paid.balance，免费用站点给的 remaining
   // （remaining = 今日可用 + 永久额度，与站点卡片上的「可用 7000 万」一致）
@@ -1373,9 +1397,12 @@ function hooks(client) {
           const keyInfo = await fetchKeyInfo(base, webTokenOf(forGroup), auth.key)
           const groupCode = keyInfo?.group
 
+          // 注意：map 的键要用 runtimeModel 返回的 id，
+          // 不能再用 m.id —— 免费组的模型带 -lite 后缀，键必须跟着变
           const out = {}
           for (const m of Object.values(listed)) {
-            out[m.id] = runtimeModel(m, base + "/v1", ID, groupCode)
+            const model = runtimeModel(m, base + "/v1", ID, groupCode)
+            out[model.id] = model
           }
           return out
         } catch (e) {
