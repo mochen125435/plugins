@@ -121,7 +121,23 @@ async function fetchModels(key) {
 /**
  * runtimeModel 生成 magpie 的模型对象。
  * SCNet 是纯文本对话网关，保守声明能力，价格留 0（由 magpie 自己统计）。
+ *
+ * 上下文上限：SCNet 的 DeepSeek-V4.1-Flash-1017-Event 与麦块云同源
+ * （同为 DeepSeek V4.1 Flash 部署），站点未公布上限；麦块云同款模型
+ * 实测 640,000 tokens，按同一数值声明，让 magpie 提前压缩会话。
+ * GLM-5.3-Flash 无实测数据，保持 0。
  */
+const CONTEXT_LIMITS = [
+  { match: /^deepseek/i, context: 640_000 },
+]
+
+function contextLimitOf(id) {
+  for (const { match, context } of CONTEXT_LIMITS) {
+    if (match.test(String(id))) return context
+  }
+  return 0
+}
+
 function runtimeModel(id) {
   return {
     id,
@@ -132,7 +148,7 @@ function runtimeModel(id) {
     headers: {},
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: 0, output: 0 },
+    limit: { context: contextLimitOf(id), output: 0 },
     capabilities: {
       temperature: true,
       reasoning: false,
