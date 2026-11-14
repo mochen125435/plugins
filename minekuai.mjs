@@ -659,7 +659,7 @@ function groupWindow(info, data) {
       used: 0,
       remaining: 100,
       aside: true,
-      display: `${head}；此 key 不会扣付费 token（余额 ${fmtTokens(paidLeft)}），需在网站密钥设置里改分组`,
+      display: `${head}；此 key 走 Lite 免费额度，不会扣付费 token（余额 ${fmtTokens(paidLeft)}）`,
     }
   }
 
