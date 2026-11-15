@@ -2,6 +2,7 @@
 import { test, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
+import { generateKeyPairSync, privateDecrypt, constants } from "node:crypto"
 
 import { ScnetPlugin, _internal } from "./scnet.mjs"
 
@@ -14,6 +15,23 @@ const BAD_COOKIE = "Token=expired"
 let server
 let base
 const realFetch = globalThis.fetch
+
+// 假站点的 RSA 密钥对：站点把公钥写进登录 JS，插件用它对密码加密
+const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 })
+const publicKeyB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64")
+const decrypt = (b64) => {
+  if (!b64) return ""
+  try {
+    return privateDecrypt(
+      { key: privateKey, padding: constants.RSA_PKCS1_PADDING },
+      Buffer.from(b64, "base64")
+    ).toString("utf8")
+  } catch {
+    return "(解密失败)"
+  }
+}
+// SSO 登录过程里假站点收到的请求，用来断言 service 形态与表单内容
+const ssoLog = []
 
 before(async () => {
   server = createServer((req, res) => {
@@ -93,6 +111,64 @@ before(async () => {
         return
       }
       return send({ code: "404", msg: "not found" })
+    }
+
+    // ---- 假 CAS / SSO：复刻 2026-11-15 实测的登录链路 ----
+    // 关键点：service 只能是 loginSsoRedirect.action 本体；
+    // 带 originalUrl 时真实站点不发 Token，这里同样不发，用来守回归。
+    if (req.url.startsWith("/sso/login")) {
+      const q = new URL(req.url, base).searchParams
+      ssoLog.push({ method: req.method, url: req.url, service: q.get("service") || "" })
+
+      if (req.method === "GET") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        return res.end(
+          `<form><input name="execution" value="e1s1">` +
+            `<script src="/login-abc123.js"></script></form>`
+        )
+      }
+
+      // POST：把表单读全，校验密码确实用站点公钥加密过
+      let raw = ""
+      req.on("data", (c) => (raw += c))
+      req.on("end", () => {
+        const form = new URLSearchParams(raw)
+        const plain = decrypt(form.get("password") || "")
+        ssoLog.push({ form: Object.fromEntries(form), plain })
+        const broken = form.get("username") === "no-token"
+        res.writeHead(302, {
+          location: broken
+            ? "/ac/api/auth/loginSsoRedirect.action?ticket=ST-NOTOKEN"
+            : "/ac/api/auth/loginSsoRedirect.action?ticket=ST-1-acx-sso-abc",
+        })
+        res.end()
+      })
+      return
+    }
+
+    if (req.url === "/login-abc123.js") {
+      res.writeHead(200, { "content-type": "application/javascript" })
+      return res.end(`var key = '${publicKeyB64}';`)
+    }
+
+    // 第一跳：发 jsessionid + Token，再 302 到自己（不带 acx 后缀）
+    if (req.url.startsWith("/ac/api/auth/loginSsoRedirect.action?ticket=ST-1-acx")) {
+      res.writeHead(302, {
+        "set-cookie": ["jsessionid=js-1; Path=/", "Token=tok-1; Path=/"],
+        location: "/ac/api/auth/loginSsoRedirect.action?ticket=ST-1",
+      })
+      return res.end()
+    }
+    // 故障分支：只发 jsessionid、200 空响应 —— 没有 Token，控制台仍判未登录
+    if (req.url.startsWith("/ac/api/auth/loginSsoRedirect.action?ticket=ST-NOTOKEN")) {
+      res.writeHead(200, { "set-cookie": ["jsessionid=js-1; Path=/"], "content-type": "text/html" })
+      return res.end("")
+    }
+
+    // 第二跳：落到页面
+    if (req.url.startsWith("/ac/api/auth/loginSsoRedirect.action?ticket=ST-1")) {
+      res.writeHead(302, { location: "/ui/mall/" })
+      return res.end()
     }
 
     send({ code: "404", msg: "not found" }, 404)
@@ -275,4 +351,36 @@ test("Cookie 过期时额度标记需要重新登录", async () => {
   const u = await p.auth.usage(async () => auth)
   assert.equal(u.signIn, "expired")
   assert.match(u.error, /未登录|请求失败/)
+})
+
+// ---- SSO 密码自动续期 ---------------------------------------------------------
+
+test("SSO 登录用不带 originalUrl 的 service，能走完整链路拿到 Token", async () => {
+  ssoLog.length = 0
+  const cookie = await _internal.ssoLogin("{{PHONE_k3x9qm2p}}", "secret-pass")
+
+  // 两枚 Cookie 缺一不可：Token 是控制台认可的凭据，jsessionid 是会话
+  assert.match(cookie, /Token=tok-1/)
+  assert.match(cookie, /jsessionid=js-1/)
+
+  const page = ssoLog.find((s) => s.method === "GET" && s.url.startsWith("/sso/login"))
+  assert.ok(page, "应当先请求登录页")
+  // 这一条是本次故障的根因：service 带 originalUrl 时站点不发 Token
+  assert.equal(page.service, "https://www.scnet.cn/ac/api/auth/loginSsoRedirect.action")
+  assert.ok(!/originalUrl/.test(page.service), "service 不能带 originalUrl，否则拿不到 Token")
+
+  const post = ssoLog.find((s) => s.form)
+  assert.ok(post, "应当提交登录表单")
+  assert.equal(post.form.username, "{{PHONE_k3x9qm2p}}")
+  assert.equal(post.form.encrypted, "true")
+  assert.equal(post.form.mode, "0")
+  assert.equal(post.plain, "secret-pass", "密码应是站点公钥 RSA 加密后提交的")
+})
+
+test("SSO 登录拿不到 Token 时明确报错，不假装成功", async () => {
+  // 用「故障账号」复刻当时的站点行为：只发 jsessionid，不发 Token
+  await assert.rejects(
+    () => _internal.ssoLogin("no-token", "secret-pass"),
+    /SSO 登录未建立会话/
+  )
 })

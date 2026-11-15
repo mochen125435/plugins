@@ -421,6 +421,9 @@ async function readUsage(client, id, auth, tier) {
   if (r.signIn !== "expired") return r
 
   // 首选：账号密码走 SSO 登录换全新会话（凭据存于账号 metadata）
+  // 失败原因要留着：否则用户只能看到「浏览器里没登录」这种误导性提示，
+  // 分不清是密码错了、要验证码，还是站点改了登录流程。
+  let ssoError = ""
   const phone = auth?.metadata?.phone
   const ssoPassword = auth?.metadata?.password
   if (phone && ssoPassword) {
@@ -445,6 +448,7 @@ async function readUsage(client, id, auth, tier) {
       return { ...r2, cookieRenewed: "sso" }
     } catch (e) {
       // 密码登录失败（密码改动/需要验证码等）才走浏览器候选
+      ssoError = String(e?.message ?? e)
     }
   }
 
@@ -480,10 +484,11 @@ async function readUsage(client, id, auth, tier) {
   const hint = candidates.length
     ? `已尝试默认浏览器的 ${candidates.length} 份资料，会话均未登录（读到的 Cookie：${candidates.flatMap((c) => c.names).join(", ")}）`
     : lastErr
+  const why = ssoError ? `密码登录失败：${ssoError}；` : ""
   return {
     user,
     windows: [],
-    error: `${hint}；请先在默认浏览器的普通窗口里登录 scnet.cn 并打开任意页面，然后点刷新重试`,
+    error: `${why}${hint}；请先在默认浏览器的普通窗口里登录 scnet.cn 并打开任意页面，然后点刷新重试`,
     signIn: "expired",
   }
 }
@@ -708,19 +713,23 @@ async function browserCookieCandidates({ signal } = {}) {
 // SCNet 的额度接口认网页 Cookie，而登录 Cookie 是会话级的，浏览器运行期间
 // 不写盘——所以「读浏览器 Cookie 库」的续期方式对它不可靠。
 // 唯一确定可靠的续期方式：用账号密码走一遍 SSO 登录，换取全新会话 Cookie。
-// 登录流程（2026-11-14 抓包分析）：
+// 登录流程（2026-11-14 抓包分析，2026-11-15 修正 service 形态）：
 //   1. GET /sso/login?service=...        → 页面里有 CAS 的 execution 令牌
 //      和登录 JS 文件名（RSA 公钥硬编码在 JS 里）；
 //   2. 密码用该公钥做 RSA PKCS#1 加密（表单字段 encrypted=true）；
 //   3. POST /sso/login（mode=0 表示账号密码登录）→ 302 重定向链建立会话；
 //   4. 沿重定向收集 Set-Cookie，拼成 Cookie 请求头。
 // 注意：登录 JS 要求附一个 name="submit" 的隐藏域（值=按钮文字），CAS 兼容。
-
-const SSO_LOGIN_URL =
-  "https://www.scnet.cn/sso/login?service=" +
-  encodeURIComponent(
-    "https://www.scnet.cn/ac/api/auth/loginSsoRedirect.action?originalUrl=https://www.scnet.cn/ui/console/index.html#/llm/token-plan"
-  )
+//
+// ⚠️ service 只能写 loginSsoRedirect.action 本体，**不能带 originalUrl 参数**。
+// 2026-11-15 实测：service 里带 originalUrl 时，POST 后 CAS 仍然发放 ticket，
+// 但 loginSsoRedirect 那一跳只发 jsessionid、HTTP 200 空响应，
+// 控制台随后对 /acx/... 一律返回 {"code":"401","msg":"用户未登录!"}；
+// 把 service 换成不带参数的本体后，同一套账号密码能正常走完
+// （loginSsoRedirect 302 到自身并 Set-Cookie: jsessionid, Token，
+//  再 302 到 /ui/mall/#/mall/home），之后 /acx/charge/... 返回 code "0"。
+// 也就是说：登录其实一直是成功的，缺的是 Token 这个真正被控制台认可的凭据，
+// originalUrl 让 Acx 端跳过了签发 Token 的分支。
 
 /** collectSetCookie 把一次响应的 Set-Cookie 收进 jar（Map：name → value）。 */
 function collectSetCookie(res, jar) {
@@ -748,12 +757,19 @@ function cookieHeaders(cookie) {
 /**
  * ssoLogin 用手机号 + 密码走 SSO 登录，返回可用的 Cookie 请求头。
  * 失败抛 Error，文案直接可读（密码错误 / 需要验证码 等）。
+ *
+ * @param {string} phone    手机号
+ * @param {string} password 明文密码（在本地 RSA 加密后才发出）
+ * @param {object} [opts]  { origin }：站点源，只在测试里替换成本地假站
  */
-async function ssoLogin(phone, password) {
+async function ssoLogin(phone, password, { origin = CONSOLE_BASE } = {}) {
   const jar = new Map()
+  const loginUrl =
+    `${origin}/sso/login?service=` +
+    encodeURIComponent(`${origin}/ac/api/auth/loginSsoRedirect.action`)
 
   // 1) 登录页：execution 令牌 + 登录 JS 地址
-  const r1 = await fetch(SSO_LOGIN_URL, {
+  const r1 = await fetch(loginUrl, {
     redirect: "manual",
     signal: AbortSignal.timeout(TIMEOUT),
   })
@@ -768,7 +784,7 @@ async function ssoLogin(phone, password) {
   if (jsUrl) {
     try {
       const js = await (
-        await fetch(new URL(jsUrl, CONSOLE_BASE).href, {
+        await fetch(new URL(jsUrl, origin).href, {
           signal: AbortSignal.timeout(TIMEOUT),
         })
       ).text()
@@ -796,7 +812,7 @@ async function ssoLogin(phone, password) {
     sensorsAnonId: "",
     submit: "登录",
   })
-  let res = await fetch(SSO_LOGIN_URL, {
+  let res = await fetch(loginUrl, {
     method: "POST",
     redirect: "manual",
     headers: {
@@ -815,7 +831,7 @@ async function ssoLogin(phone, password) {
     if (!loc) break
     const hopHeaders = { "User-Agent": "magpie-scnet" }
     if (jar.size) hopHeaders.Cookie = buildCookieHead(jar)
-    res = await fetch(loc.startsWith("/") ? new URL(loc, CONSOLE_BASE).href : loc, {
+    res = await fetch(new URL(loc, origin).href, {
       redirect: "manual",
       headers: hopHeaders,
       signal: AbortSignal.timeout(TIMEOUT),
